@@ -1,0 +1,402 @@
+---
+title: "Broadband Usage in the U.S."
+author: "Shanley Camara"
+date: "2023/01/13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Internet accessibility in the United States is greatly important for people to thrive in our society. Many rural communities may not even have internet services available at all, let alone the ability to pay and access those services. Broadband allows people to access the internet at much faster speeds than other more outdated methods and is accessible at any time. In this project we will be examining broadband availability and usage by county across the United States, and then predict broadband usage based on county census data using several machine learning techniques. 
+
+Data sources:
+
+Broadband by county: https://data.world/amberthomas/broadband-usage-in-us
+
+County census data: https://www.kaggle.com/datasets/mmattson/us-broadband-availability?resource=download&select=broadband_access.csv
+
+## Data and Packages
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(caret)
+library(broom)
+library(tidymodels)
+library(vip)
+library(stringr)
+library(DMwR2)
+library(forcats)
+library(randomForest)
+library(e1071)
+library(pls)
+library(glmnet)
+
+set.seed(42)
+
+census <- read.csv("C:\\Users\\shans\\Downloads\\IMLS_county_data.csv", header = T, sep = ",",colClasses = c(FIPS_County = "character"))
+
+broadband <- read.csv("C:\\Users\\shans\\Downloads\\broadband_by_county.csv", header = T, sep = ",", colClasses = c(COUNTY.ID = "character"))
+
+```
+
+```{r}
+# Prepare datasets and join by unique county fips codes
+
+broadband <- broadband %>%
+    rename(county_fips = COUNTY.ID)
+
+census$county_fips <- paste(census$FIPS_State, '', census$FIPS_County) %>% str_remove_all(" ")
+
+# Joining the data using inner_join with broadband first
+broadband_census <- broadband %>% inner_join(census, by = "county_fips") 
+```
+
+## Data Cleaning
+
+Let's start by taking a look at our table after we joined by county:
+```{r}
+broadband_census %>% head()
+```
+
+We have some repeated columns and inconsisent column names, so let's start by cleaning those up:
+```{r}
+broadband_census <- broadband_census %>% 
+  rename(state = ST, county_name = COUNTY.NAME, broadband_availability = BROADBAND.AVAILABILITY.PER.FCC, broadband_usage = BROADBAND.USAGE, population = Population_2019, unemployment_rate = Unemployment.rate.2019, perc_no_health_ins = Percent.w.o.Health.insurance, pov_rate = Poverty.Rate...., perc_snap = Percent.received.SNAP..2018., perc_no_computer = Percent.with.no.home.computer..2018., perc_no_internet = Percent.with.no.home.Internet..2018.) %>%
+  select(-GEO_ID, -FIPS_State, -FIPS_County, -NAME, -County, -State, -Stabr, -MOE....w.o.health.ins., -MOE..Poverty.Rate...., -MOE.SNAP, -MOE.No.Computer, -MOE.no.Internet, -Percent.with.home.Broadband..2018., -MOE.Broadband, -Number.of.Broadband.providers..2019., -Population.for.whom.broadband.available..2019...., -Lowest.broadband.cost.per.month..2019....)
+
+broadband_census %>% head()
+```
+
+Get column information:
+```{r}
+broadband_census %>% str()
+```
+
+We can see here that several of our variables are categorized as characters when they should really be numerical. Here can change the data type of those variables:
+```{r, warning = FALSE}
+broadband_census <- broadband_census %>% mutate(broadband_availability = as.numeric(paste(broadband_availability)), broadband_usage = as.numeric(paste(broadband_usage)), population = as.numeric(paste(population)), unemployment_rate = as.numeric(paste(unemployment_rate)), pov_rate = as.numeric(paste(pov_rate)))
+
+broadband_census %>% str()
+```
+
+Now that our numeric variables are indeed numeric, we can find the summary statistics for each of our variables and see if there are any null values:
+```{r}
+broadband_census %>% summary()
+```
+
+It looks like there are a few null values in our dataset but not too many, meaning our data is not sparse. We will impute these later with knn once the data is split into testing and training sets. There does appear to be 11 nulls in the broadband_usage column, which is the variable we eventually want to predict. We will remove these from the data set for now, and come back to them later when we have a tried and tested model. The other columns with missing values can be imputed with k-nearest neighbors (knn) imputation.
+
+```{r}
+broadband_missing <- broadband_census[is.na(broadband_census$broadband_usage), ]
+
+broadband_census <- broadband_census[!(is.na(broadband_census$broadband_usage)), ]
+```
+
+We will want to finish preprocessing and split the data into training and testing sets before we impute the other missing values. This is because we do not want any influence from the training set to affect the testing set, so the imputation process will occur in each set separately.
+
+#### Splitting training and testing data
+```{r}
+sample_size = floor(0.8*nrow(broadband_census))
+
+picked = sample(seq_len(nrow(broadband_census)),size = sample_size)
+broadband_train = broadband_census[picked,]
+broadband_test = broadband_census[-picked,]
+```
+
+```{r}
+# retrieve mean and standard deviation of broadband usage before scaling for later use
+broadband_mean = mean(broadband_train$broadband_usage)
+broadband_std = sd(broadband_train$broadband_usage)
+```
+
+#### Impute missing values
+```{r}
+impute_train <- preProcess(x = broadband_train,
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = median)
+broadband_train <- predict(impute_train, broadband_train, na.action = na.pass)
+
+impute_test <- preProcess(x = broadband_test,
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = median)
+broadband_test <- predict(impute_test, broadband_test, na.action = na.pass)
+
+impute_missing <- preProcess(x = broadband_missing[,c(1:4,6:12)],
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = median)
+broadband_missing <- predict(impute_missing, broadband_missing, na.action = na.pass)
+
+
+anyNA(broadband_train)
+anyNA(broadband_test)
+```
+
+
+#### Scaling the data
+Scaling the data is an important preprocessing step to ensure our prediction models perform correctly. We will use a standard scaler on the training data and then apply that scale to our test set and missing values set.
+
+```{r}
+scale_parameters <- preProcess(broadband_train, method = c("center", "scale"))
+
+broadband_train <- predict(scale_parameters, broadband_train)
+broadband_test <- predict(scale_parameters, broadband_test)
+broadband_missing <- predict(scale_parameters, broadband_missing)
+```
+
+Now that our data is cleaned up and split, let's perform some exploratory analysis and visualizations before we move on to modeling.
+
+## Exploratory Analysis
+
+#### Graphs
+
+Broadband usage histogram shows us the distribution of broadband usage across our entire data set:
+```{r}
+broadband_census %>% ggplot(aes(x = broadband_usage)) +
+  geom_histogram(bins = 20, fill = 'cyan4', col='grey') +
+  labs(title = "Broadband Usage Frequency Histogram", x = "Proportion of Broadband Usage", y = "Count")
+```
+The distribution of broadband usage appears to be a bit right skewed, with a peak of 0.1-0.15 proportion of broadband usage.
+
+Broadband usage proportion by state:
+```{r, fig.width = 14}
+aggregate_state <- aggregate(broadband_census$broadband_usage ~ broadband_census$state, data = broadband_census, median)
+
+aggregate_state %>% ggplot(aes(x = fct_rev(fct_reorder(`broadband_census$state`, `broadband_census$broadband_usage`)), y = `broadband_census$broadband_usage`)) +
+  geom_col(fill = 'cyan4') +
+  labs(title = "Median Broadband Usage Proportion by State", x = "State", y = "Broadband Usage Proportion")
+```
+Our plot shows that New Jersey has the highest median broadband usage, while Mississippi has the lowest.
+
+## Modeling
+
+We will be attempting several models to predict the broadband_usage. These models are multivariable linear, k-nearest neighbors regression, regularized regression, and principle component regression. 
+
+#### Simple Linear Regression Model
+
+This model fits our data linearly to predict the broadband usage proportion. 
+```{r}
+# Fitting Simple Linear Regression
+# to the Training set
+lm.r = lm(formula = broadband_usage ~ .,
+                          data = broadband_train[,c(4:12)])
+coef(lm.r)
+summary(lm.r)
+ 
+# Predicting the Test set results
+ypred = predict(lm.r, newdata = broadband_train)
+```
+Correlation = 0.5234
+P-value ~ 0
+
+Our results show that there is a moderate, positive linear correlation between our explanatory and response variables. A low p-value suggests that this is statistically significant.
+
+Residuals vs Predicted:
+```{r}
+lm.r_aug <- augment(lm.r)
+ggplot(lm.r_aug, mapping = aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "gray", lty = "dashed") +
+  labs(x = "Predicted", y = "Residuals")
+```
+This plot of the residual values versus the predicted values show that there may be some nonconstant variance in our dataset. This may mean that our data may not be linear, and so this model may not suit our needs.
+
+Mean Square Error (MSE) and Root Mean Square Error (RMSE) ways of determining error in the model:
+```{r}
+MSE = (1/96)*sum((abs(lm.r$residuals))^2)
+MSE
+
+RMSE = sqrt(MSE)
+RMSE
+```
+
+Test model on testing data:
+```{r}
+test_pred <- data.frame(broadband_usage = broadband_test$broadband_usage, pred = predict(lm.r, broadband_test[,c(4,6:12)])) %>%
+  mutate(resid = broadband_usage - pred) %>% filter(!is.na(pred))
+
+MSE = (1/96)*sum((abs(test_pred$resid))^2)
+MSE
+
+RMSE = sqrt(MSE)
+RMSE
+
+compare_models <- data.frame(Model = "Linear Regression", MSE = MSE, RMSE = RMSE, stringsAsFactors=FALSE)
+```
+
+Using this model on the test set yields a lower MSE and RMSE, so this may indicate that the model is effective at predicting broadband usage.
+
+#### K-Nearest Neighbors Regression
+
+The K-Nearest Neighbors model predicts our broadband usage based on the similarity within the other variables. KNN works by finding the distance between an input value and all other examples in the data, and then finds the average of the k values with the smallest distance to the input. In this model we will be testing several different k values (number of neighbors) and use the model with the least errors.
+
+Trying multiple values of k:
+```{r, warning = FALSE}
+# Fit the model on the training set
+model <- train(
+  x = broadband_train[,c(4,6:12)], 
+  y = broadband_train[,5],
+  method = "knn",
+  trControl = trainControl("cv", number = 10),
+  tuneLength = 30
+  )
+
+model
+
+model$bestTune
+
+# Plot model accuracy vs different values of k
+plot(model)
+
+postResample(predict(model), broadband_train$broadband_usage)
+```
+The above shows that 33 neighbors yields a model with the least error, so we will fit a model on 33 neighbors.
+
+Fit the model:
+```{r}
+fit <- knnreg(broadband_train[,c(4,6:12)], broadband_train[,5], k = 33) 
+
+fittedY <- predict(fit, broadband_test[,c(4,6:12)])
+
+# plot of residuals
+ggplot(broadband_test, mapping = aes(x = broadband_usage, y = (broadband_test$broadband_usage - fittedY))) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "gray", lty = "dashed") +
+  labs(x = "Predicted", y = "Residuals")
+
+summary(fit)
+
+```
+
+MSE and RMSE:
+```{r}
+MSE = (1/96)*sum((abs(broadband_test$broadband_usage - predict(fit, broadband_test[,c(4,6:12)])))^2)
+MSE
+
+RMSE = sqrt(MSE)
+RMSE
+
+compare_models <- rbind(compare_models, list('KNN', MSE, RMSE))
+```
+
+The reduction in error is a good sign, however the nonrandom pattern on the residual plot may mean that this model is not quite where we want it to be.
+
+#### Regularized regression (glmnet)
+
+Regularized regression (also called glm for generalized linear model) is a sort of penalized multivariable linear regression. The penalties are applied based on the idea of "maximum likelihood." We will be using elastic net regression, which is a mix of lasso and ridge regularization.
+
+Cross validation to find optimal alpha value and lambda value:
+```{r}
+# find alpha with lowest mse
+alpha <- seq(0.01, 0.99, 0.01)
+best <- list(a=NULL, mse=NULL)
+ 
+for (i in 1:length(alpha)) 
+{
+   cvg <- cv.glmnet(as.matrix(broadband_train[,c(4,6:12)]), as.matrix(broadband_train[,5]), family = "gaussian", alpha = alpha[i])
+   best$a <- c(best$a, alpha[i])
+   best$mse <- c(best$mse, min(cvg$cvm))
+}
+ 
+index <- which(best$mse==min(best$mse))
+best_alpha <- best$a[index]
+best_mse <- best$mse[index]
+
+# train with best alpha to find best lambda
+elastic_cv <- cv.glmnet(as.matrix(broadband_train[,c(4,6:12)]), as.matrix(broadband_train[,5]), family = "gaussian", alpha = best_alpha)
+
+best_lambda <- elastic_cv$lambda.min
+
+cat("alpha:", best_alpha, " mse:", best_mse, " lambda:", best_lambda)
+```
+
+Now that we have found the optimal values for our model, let's make a final model:
+```{r}
+elastic_mod <- glmnet(as.matrix(broadband_train[,c(4,6:12)]), as.matrix(broadband_train[,5]), family = "gaussian", alpha = best_alpha, lambda = best_lambda)
+coef(elastic_mod)
+```
+
+Now let's test on testing data and retrieve mse, rmse, and r-squared values:
+```{r}
+pred <- predict(elastic_mod, as.matrix(broadband_test[,c(4,6:12)]))
+
+rmse <- sqrt(mean((pred-as.matrix(broadband_test[,5]))^2))
+R2 <- 1 - (sum((as.matrix(broadband_test[,5])-pred )^2)/sum((as.matrix(broadband_test[,5])-mean(as.matrix(broadband_test[,5])))^2))
+mse <- mean((as.matrix(broadband_test[,5]) - pred)^2)
+
+compare_models <- rbind(compare_models, list('Elastic Net', mse, rmse))
+
+cat(" RMSE:", rmse, "\n", "R-squared:", R2, "\n", "MSE:", mse)
+```
+
+This model appears quite strong with a low MSE and RMSE on the testing data. Let's check the plot of residuals to see if this model gives us constant variance.
+```{r}
+# plot of residuals
+ggplot(broadband_test, mapping = aes(x = broadband_usage, y = (broadband_test$broadband_usage - pred))) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "gray", lty = "dashed") +
+  labs(x = "Predicted", y = "Residuals")
+```
+Looks like we are still getting some nonrandom variance in our model. 
+
+#### Principle Component Regression
+
+Principle component regression (PCR) expands on the multivariable linear regression by accounting for multicollinearity of predictor variables, which is when multiple predictors are correlated to each other. Multicollinearity effects the accuracy of multivariable linear regression, so PCR should improve the accuracy of this model.
+
+Fit the model on training data:
+```{r}
+pcr_model <- pcr(formula = broadband_usage ~ .,
+                          data = broadband_train[,c(4:12)], validation = "LOO")
+summary(pcr_model)
+
+validationplot(pcr_model, val.type = "RMSE")
+plot(pcr_model)
+```
+
+Using the elbow method, it appears that 2 components is sufficient for predicting broadband usage, as most additional components seems to add little to the model. Let's test a PCR model on 2 components:
+```{r, warning = FALSE}
+pcr_pred <- predict(pcr_model, data = broadband_test, ncomp = 2)
+
+rmse <- sqrt(mean((pcr_pred-broadband_test[,5])^2))
+mse <- mean((broadband_test[,5] - pcr_pred)^2)
+
+compare_models <- rbind(compare_models, list('PCR', mse, rmse))
+
+cat(" RMSE:", rmse, "\n", "MSE:", mse)
+```
+These RMSE and MSE values are fairly low, meaning this model may be pretty good. 
+
+## Comparing Models
+
+Lets take a look at our RMSE and MSE values for each model and for the training and testing data. 
+
+```{r}
+compare_models
+```
+
+Our model with the smallest error after predicting on the testing data is the Elastic Net Regularized Regression Model. We want a value as close to 0 as possible for RMSE, and a value of 0.726 is very close for a model based on real world data. I would recommend this model for predicting the broadband usage for a given U.S. county.
+
+Let's try this model out on our 11 counties that were missing broadband usage data:
+```{r}
+broadband_predict <- broadband_missing %>% mutate(broadband_usage = predict(elastic_mod, as.matrix(broadband_missing[,c(4,6:12)]))) 
+
+broadband_predict_transform <- broadband_predict %>% select(state, county_name, broadband_usage)
+broadband_predict_transform <- broadband_predict_transform %>% mutate(broadband_usage = (broadband_usage * broadband_std) + broadband_mean)
+
+broadband_predict_transform %>% ggplot(aes(x = fct_rev(fct_reorder(paste(county_name,', ', state), broadband_usage)), y = broadband_usage)) +
+  geom_col(fill = 'cyan4') +
+  labs(title = "Predicted Broadband Usage", x = "County", y = "Broadband Usage Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_text(aes(label = round(broadband_usage, digits = 3)), vjust = -0.4) +
+  ylim(0, 0.75)
+```
+
+
+
+
