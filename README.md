@@ -8,21 +8,21 @@ Find code outputs in the pdf file knit from the R-Markdown file.
 
 ### Machine Learning Process
 Here is a brief list of all methods used in this project:
-I. Data Preprocessing
-  A. Data wrangling and cleaning
-  B. Splitting training and testing data
-  C. Impute missing values
-  D. Center and Scale
-II. Exploratory Analysis
-  A. Data Visualizations
-III. Modeling
-  A. Simple Linear Regression Model
-  B. K-Nearest Neighbors Regression
-  C. Regularized Regression with Elastic Net
-  D. Principle Component Regression
-IV. Compare Models
-  A. RMSE values
-  B. Final Model 
+- Data Preprocessing
+  - Data wrangling and cleaning
+  - Splitting training and testing data
+  - Impute missing values
+  - Center and Scale
+- Exploratory Analysis
+  - Data Visualizations
+- Modeling
+  - Simple Linear Regression Model
+  - K-Nearest Neighbors Regression
+  - Regularized Regression with Elastic Net
+  - Principle Component Regression
+- Compare Models
+  - RMSE values
+  - Final Model 
 
 ### Data sources
 
